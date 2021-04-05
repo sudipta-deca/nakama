@@ -19,6 +19,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
+
 	"github.com/dop251/goja"
 	"github.com/gofrs/uuid"
 	"github.com/golang/protobuf/jsonpb"
@@ -38,14 +40,15 @@ type RuntimeJavaScriptMatchCore struct {
 	deferMessageFn RuntimeMatchDeferMessageFunction
 	presenceList   *MatchPresenceList
 
-	id       uuid.UUID
-	node     string
-	module   string
-	tickRate int
-	stopped  *atomic.Bool
-	idStr    string
-	stream   PresenceStream
-	label    *atomic.String
+	id         uuid.UUID
+	node       string
+	module     string
+	tickRate   int
+	createTime int64
+	stopped    *atomic.Bool
+	idStr      string
+	stream     PresenceStream
+	label      *atomic.String
 
 	vm            *goja.Runtime
 	initFn        goja.Callable
@@ -63,7 +66,7 @@ type RuntimeJavaScriptMatchCore struct {
 	// ctxCancelFn context.CancelFunc
 }
 
-func NewRuntimeJavascriptMatchCore(logger *zap.Logger, module string, db *sql.DB, jsonpbMarshaler *jsonpb.Marshaler, jsonpbUnmarshaler *jsonpb.Unmarshaler, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, localCache *RuntimeJavascriptLocalCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, matchRegistry MatchRegistry, tracker Tracker, streamManager StreamManager, router MessageRouter, matchCreateFn RuntimeMatchCreateFunction, eventFn RuntimeEventCustomFunction, id uuid.UUID, node string, stopped *atomic.Bool, matchHandlers *jsMatchHandlers, modCache *RuntimeJSModuleCache) (RuntimeMatchCore, error) {
+func NewRuntimeJavascriptMatchCore(logger *zap.Logger, module string, db *sql.DB, jsonpbMarshaler *jsonpb.Marshaler, jsonpbUnmarshaler *jsonpb.Unmarshaler, config Config, socialClient *social.Client, leaderboardCache LeaderboardCache, rankCache LeaderboardRankCache, localCache *RuntimeJavascriptLocalCache, leaderboardScheduler LeaderboardScheduler, sessionRegistry SessionRegistry, sessionCache SessionCache, matchRegistry MatchRegistry, tracker Tracker, streamManager StreamManager, router MessageRouter, matchCreateFn RuntimeMatchCreateFunction, eventFn RuntimeEventCustomFunction, id uuid.UUID, node string, stopped *atomic.Bool, matchHandlers *jsMatchHandlers, modCache *RuntimeJSModuleCache) (RuntimeMatchCore, error) {
 	runtime := goja.New()
 
 	jsLogger := NewJsLogger(logger)
@@ -73,7 +76,7 @@ func NewRuntimeJavascriptMatchCore(logger *zap.Logger, module string, db *sql.DB
 		logger.Fatal("Failed to initialize JavaScript runtime", zap.Error(err))
 	}
 
-	nakamaModule := NewRuntimeJavascriptNakamaModule(logger, db, jsonpbMarshaler, jsonpbUnmarshaler, config, socialClient, leaderboardCache, rankCache, localCache, leaderboardScheduler, sessionRegistry, matchRegistry, tracker, streamManager, router, eventFn, matchCreateFn)
+	nakamaModule := NewRuntimeJavascriptNakamaModule(logger, db, jsonpbMarshaler, jsonpbUnmarshaler, config, socialClient, leaderboardCache, rankCache, localCache, leaderboardScheduler, sessionRegistry, sessionCache, matchRegistry, tracker, streamManager, router, eventFn, matchCreateFn)
 	nk := runtime.ToValue(nakamaModule.Constructor(runtime))
 	nkInst, err := runtime.New(nk)
 	if err != nil {
@@ -125,11 +128,12 @@ func NewRuntimeJavascriptMatchCore(logger *zap.Logger, module string, db *sql.DB
 		// presenceList set in MatchInit.
 		// tickRate set in MatchInit.
 
-		id:      id,
-		node:    node,
-		stopped: stopped,
-		idStr:   fmt.Sprintf("%v.%v", id.String(), node),
-		module:  module,
+		id:         id,
+		node:       node,
+		stopped:    stopped,
+		idStr:      fmt.Sprintf("%v.%v", id.String(), node),
+		module:     module,
+		createTime: time.Now().UTC().UnixNano() / int64(time.Millisecond),
 		stream: PresenceStream{
 			Mode:    StreamModeMatchAuthoritative,
 			Subject: id,
@@ -211,7 +215,7 @@ func (rm *RuntimeJavaScriptMatchCore) MatchInit(presenceList *MatchPresenceList,
 		return nil, 0, errors.New("matchInit is expected to return an object with a 'state' property")
 	}
 
-	if err := rm.matchRegistry.UpdateMatchLabel(rm.id, rm.tickRate, rm.module, label); err != nil {
+	if err := rm.matchRegistry.UpdateMatchLabel(rm.id, rm.tickRate, rm.module, label, rm.createTime); err != nil {
 		return nil, 0, err
 	}
 	rm.label.Store(label)
@@ -258,6 +262,10 @@ func (rm *RuntimeJavaScriptMatchCore) MatchJoinAttempt(tick int64, state interfa
 		return nil, false, "", err
 	}
 
+	if goja.IsNull(retVal) || goja.IsUndefined(retVal) {
+		return nil, false, "", nil
+	}
+
 	retMap, ok := retVal.Export().(map[string]interface{})
 	if !ok {
 		return nil, false, "", errors.New("matchJoinAttempt is expected to return an object with 'state' and 'accept' properties")
@@ -299,6 +307,7 @@ func (rm *RuntimeJavaScriptMatchCore) MatchJoin(tick int64, state interface{}, j
 		presenceObj.Set("sessionId", p.SessionID.String())
 		presenceObj.Set("username", p.Username)
 		presenceObj.Set("node", p.Node)
+		presenceObj.Set("reason", p.Reason)
 
 		presences = append(presences, presenceObj)
 	}
@@ -307,6 +316,10 @@ func (rm *RuntimeJavaScriptMatchCore) MatchJoin(tick int64, state interface{}, j
 	retVal, err := rm.joinFn(goja.Null(), args...)
 	if err != nil {
 		return nil, err
+	}
+
+	if goja.IsNull(retVal) || goja.IsUndefined(retVal) {
+		return nil, nil
 	}
 
 	retMap, ok := retVal.Export().(map[string]interface{})
@@ -330,6 +343,7 @@ func (rm *RuntimeJavaScriptMatchCore) MatchLeave(tick int64, state interface{}, 
 		presenceObj.Set("sessionId", p.SessionID.String())
 		presenceObj.Set("username", p.Username)
 		presenceObj.Set("node", p.Node)
+		presenceObj.Set("reason", p.Reason)
 
 		presences = append(presences, presenceObj)
 	}
@@ -338,6 +352,10 @@ func (rm *RuntimeJavaScriptMatchCore) MatchLeave(tick int64, state interface{}, 
 	retVal, err := rm.leaveFn(goja.Null(), args...)
 	if err != nil {
 		return nil, err
+	}
+
+	if goja.IsNull(retVal) || goja.IsUndefined(retVal) {
+		return nil, nil
 	}
 
 	retMap, ok := retVal.Export().(map[string]interface{})
@@ -389,6 +407,10 @@ func (rm *RuntimeJavaScriptMatchCore) MatchLoop(tick int64, state interface{}, i
 		return nil, nil
 	}
 
+	if goja.IsNull(retVal) || goja.IsUndefined(retVal) {
+		return nil, nil
+	}
+
 	retMap, ok := retVal.Export().(map[string]interface{})
 	if !ok {
 		return nil, errors.New("matchLoop is expected to return an object with 'state' property")
@@ -414,6 +436,10 @@ func (rm *RuntimeJavaScriptMatchCore) MatchTerminate(tick int64, state interface
 		return nil, errors.New("matchTerminate is expected to return an object with 'state' property")
 	}
 
+	if goja.IsNull(retVal) || goja.IsUndefined(retVal) {
+		return nil, nil
+	}
+
 	newState, ok := retMap["state"]
 	if !ok {
 		return nil, errors.New("matchTerminate is expected to return an object with 'state' property")
@@ -434,8 +460,16 @@ func (rm *RuntimeJavaScriptMatchCore) Label() string {
 	return rm.label.Load()
 }
 
+func (rm *RuntimeJavaScriptMatchCore) TickRate() int {
+	return rm.tickRate
+}
+
 func (rm *RuntimeJavaScriptMatchCore) HandlerName() string {
 	return rm.module
+}
+
+func (rm *RuntimeJavaScriptMatchCore) CreateTime() int64 {
+	return rm.createTime
 }
 
 func (rm *RuntimeJavaScriptMatchCore) Cancel() {
@@ -706,7 +740,7 @@ func (rm *RuntimeJavaScriptMatchCore) matchLabelUpdate(r *goja.Runtime) func(goj
 
 		input := getJsString(r, f.Argument(0))
 
-		if err := rm.matchRegistry.UpdateMatchLabel(rm.id, rm.tickRate, rm.module, input); err != nil {
+		if err := rm.matchRegistry.UpdateMatchLabel(rm.id, rm.tickRate, rm.module, input, rm.createTime); err != nil {
 			panic(r.NewGoError(fmt.Errorf("error updating match label: %v", err.Error())))
 		}
 		rm.label.Store(input)

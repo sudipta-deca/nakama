@@ -20,6 +20,7 @@ import (
 	"database/sql"
 	"fmt"
 	"io/ioutil"
+	"math"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -27,7 +28,7 @@ import (
 	"strings"
 	"time"
 
-	jwt "github.com/dgrijalva/jwt-go"
+	"github.com/dgrijalva/jwt-go"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	"github.com/gorilla/handlers"
@@ -65,6 +66,7 @@ type ConsoleServer struct {
 	config               Config
 	tracker              Tracker
 	router               MessageRouter
+	sessionCache         SessionCache
 	matchRegistry        MatchRegistry
 	statusHandler        StatusHandler
 	runtimeInfo          *RuntimeInfo
@@ -78,9 +80,10 @@ type ConsoleServer struct {
 	api                  *ApiServer
 	rpcMethodCache       *rpcReflectCache
 	cookie               string
+	httpClient           *http.Client
 }
 
-func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, config Config, tracker Tracker, router MessageRouter, statusHandler StatusHandler, runtimeInfo *RuntimeInfo, matchRegistry MatchRegistry, configWarnings map[string]string, serverVersion string, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, api *ApiServer, cookie string) *ConsoleServer {
+func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.DB, config Config, tracker Tracker, router MessageRouter, sessionCache SessionCache, statusHandler StatusHandler, runtimeInfo *RuntimeInfo, matchRegistry MatchRegistry, configWarnings map[string]string, serverVersion string, leaderboardCache LeaderboardCache, leaderboardRankCache LeaderboardRankCache, api *ApiServer, cookie string) *ConsoleServer {
 	var gatewayContextTimeoutMs string
 	if config.GetConsole().IdleTimeoutMs > 500 {
 		// Ensure the GRPC Gateway timeout is just under the idle timeout (if possible) to ensure it has priority.
@@ -104,6 +107,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 		config:               config,
 		tracker:              tracker,
 		router:               router,
+		sessionCache:         sessionCache,
 		matchRegistry:        matchRegistry,
 		statusHandler:        statusHandler,
 		configWarnings:       configWarnings,
@@ -115,6 +119,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 		leaderboardRankCache: leaderboardRankCache,
 		api:                  api,
 		cookie:               cookie,
+		httpClient:           &http.Client{Timeout: 5 * time.Second},
 	}
 
 	if err := s.initRpcMethodCache(); err != nil {
@@ -154,7 +159,10 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 		dialAddr = fmt.Sprintf("%v:%d", config.GetConsole().Address, config.GetConsole().Port-3)
 	}
 	dialOpts := []grpc.DialOption{
-		grpc.WithDefaultCallOptions(grpc.MaxCallSendMsgSize(int(config.GetConsole().MaxMessageSizeBytes))),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallSendMsgSize(int(config.GetConsole().MaxMessageSizeBytes)),
+			grpc.MaxCallRecvMsgSize(math.MaxInt32),
+		),
 		grpc.WithInsecure(),
 	}
 	if err := console.RegisterConsoleHandlerFromEndpoint(ctx, grpcGateway, dialAddr, dialOpts); err != nil {
@@ -277,7 +285,7 @@ func StartConsoleServer(logger *zap.Logger, startupLogger *zap.Logger, db *sql.D
 
 func registerDashboardHandlers(logger *zap.Logger, router *mux.Router) {
 	indexFn := func(w http.ResponseWriter, r *http.Request) {
-		indexFile, err := console.BoxFS.Open("index.html")
+		indexFile, err := console.UIFS.Open("index.html")
 		if err != nil {
 			logger.Error("Failed to open index file.", zap.Error(err))
 			w.WriteHeader(http.StatusNotFound)
@@ -303,7 +311,7 @@ func registerDashboardHandlers(logger *zap.Logger, router *mux.Router) {
 		logger = logger.With(zap.String("path", path))
 
 		// check whether a file exists at the given path
-		if console.BoxFS.Has(path) {
+		if _, err := console.UIFS.Open(path); err == nil {
 			// otherwise, use http.FileServer to serve the static dir
 			r.URL.Path = path // override the path with the prefixed path
 			console.UI.ServeHTTP(w, r)
